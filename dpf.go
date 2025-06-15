@@ -1,21 +1,21 @@
 package go2dpf
 
 import (
-	"github.com/deadsy/libusb"
 	"fmt"
+	"github.com/google/gousb"
 	"log"
 )
 
 const (
-	ax206vid = 0x1908 // Hacked frames USB Vendor ID
-	ax206pid = 0x0102 // Hacked frames USB Product ID
-
+	ax206vid          = 0x1908 // Hacked frames USB Vendor ID
+	ax206pid          = 0x0102 // Hacked frames USB Product ID
+	endpOut           = 0x01
+	endpIn            = 0x81
+	intfNum           = 0
+	cfgNum            = 1
+	scsiTimeout       = 1000 // milliseconds
 	usbCmdSetProperty = 0x01 // USB command: Set property
-	usbCmdBlit = 0x12 // USB command: Blit to screen
-
-	ax206interface = 0x00
-	ax206endpOut = 0x01
-	ax206endpIn = 0x81
+	usbCmdBlit        = 0x12 // USB command: Blit to screen
 )
 
 type DPF struct {
@@ -23,50 +23,83 @@ type DPF struct {
 	Height int
 	Debug  bool
 
-	ctx      libusb.Context
-	udev     libusb.Device_Handle
-	hasCtx   bool
-	hasUdev  bool
-	hasClaim bool
+	ctx   *gousb.Context
+	dev   *gousb.Device
+	intf  *gousb.Interface
+	epOut *gousb.OutEndpoint
+	epIn  *gousb.InEndpoint
 }
 
 func OpenDpf() (*DPF, error) {
-	vid := uint16(ax206vid)
-	pid := uint16(ax206pid)
-	dpf := new(DPF)
+	ctx := gousb.NewContext()
 
-	err := libusb.Init(&dpf.ctx)
+	dev, err := ctx.OpenDeviceWithVIDPID(ax206vid, ax206pid)
 	if err != nil {
-		return nil, err
+		ctx.Close()
+		return nil, fmt.Errorf("Failed to open device: %v", err)
 	}
-	dpf.hasCtx = true
-
-	dpf.udev = libusb.Open_Device_With_VID_PID(dpf.ctx, vid, pid)
-	if dpf.udev == nil {
-		return nil, fmt.Errorf("Failed to open device [%04x:%04x] (may be no permission?)", vid, pid)
+	if dev == nil {
+		ctx.Close()
+		return nil, fmt.Errorf("Device %04x:%04x not found", ax206vid, ax206pid)
 	}
-	dpf.hasUdev = true
 
-	libusb.Set_Auto_Detach_Kernel_Driver(dpf.udev, true)
-
-	if err = libusb.Claim_Interface(dpf.udev, ax206interface); err != nil {
-		return nil, fmt.Errorf("Can't claim interface: %v", err)
+	if err := dev.SetAutoDetach(true); err != nil {
+		dev.Close()
+		ctx.Close()
+		return nil, fmt.Errorf("Failed to auto-detach kernel driver: %v", err)
 	}
-	dpf.hasClaim = true
 
-	return dpf, nil
+	cfg, err := dev.Config(cfgNum)
+	if err != nil {
+		dev.Close()
+		ctx.Close()
+		return nil, fmt.Errorf("Failed to set config: %v", err)
+	}
+
+	intf, err := cfg.Interface(intfNum, 0)
+	if err != nil {
+		cfg.Close()
+		dev.Close()
+		ctx.Close()
+		return nil, fmt.Errorf("Failed to claim interface: %v", err)
+	}
+
+	epOut, err := intf.OutEndpoint(endpOut)
+	if err != nil {
+		intf.Close()
+		cfg.Close()
+		dev.Close()
+		ctx.Close()
+		return nil, fmt.Errorf("Failed to open OUT endpoint: %v", err)
+	}
+
+	epIn, err := intf.InEndpoint(endpIn & 0x0f)
+	if err != nil {
+		intf.Close()
+		cfg.Close()
+		dev.Close()
+		ctx.Close()
+		return nil, fmt.Errorf("Failed to open IN endpoint: %v", err)
+	}
+
+	return &DPF{
+		ctx:   ctx,
+		dev:   dev,
+		intf:  intf,
+		epOut: epOut,
+		epIn:  epIn,
+	}, nil
 }
 
-func (dpf *DPF) Close() {
-	if dpf.hasClaim {
-		libusb.Release_Interface(dpf.udev, ax206interface)
+func (d *DPF) Close() {
+	if d.intf != nil {
+		d.intf.Close()
 	}
-	if dpf.hasUdev {
-		libusb.Close(dpf.udev)
+	if d.dev != nil {
+		d.dev.Close()
 	}
-	if dpf.hasCtx {
-		libusb.Exit(dpf.ctx)
-		dpf.hasCtx = false
+	if d.ctx != nil {
+		d.ctx.Close()
 	}
 }
 
@@ -113,16 +146,14 @@ func (dpf *DPF) Blit(img *ImageRGB565) error {
 		0, 6, usbCmdBlit,
 		byte(r.Min.X), byte(r.Min.X >> 8),
 		byte(r.Min.Y), byte(r.Min.Y >> 8),
-		byte(r.Max.X-1), byte((r.Max.X-1) >> 8),
-		byte(r.Max.Y-1), byte((r.Max.Y-1) >> 8),
+		byte(r.Max.X - 1), byte((r.Max.X - 1) >> 8),
+		byte(r.Max.Y - 1), byte((r.Max.Y - 1) >> 8),
 		0,
 	}
 	return dpf.scsiWrite(cmd, img.PixRect())
 }
 
-const scsiTimeout = 1000
-
-func (dpf *DPF) scsiCmdPrepare(cmd []byte, blockLen int, out bool) []byte {
+func (d *DPF) scsiCmdPrepare(cmd []byte, blockLen int, out bool) []byte {
 	var bmCBWFlags byte
 	if out {
 		bmCBWFlags = 0x00
@@ -130,111 +161,67 @@ func (dpf *DPF) scsiCmdPrepare(cmd []byte, blockLen int, out bool) []byte {
 		bmCBWFlags = 0x80
 	}
 	buf := []byte{
-		0x55, 0x53, 0x42, 0x43, // dCBWSignature
-		0xde, 0xad, 0xbe, 0xef, // dCBWTag
-		byte(blockLen), byte(blockLen >> 8), byte(blockLen >> 16), byte(blockLen >> 24), // dCBWLength (4 byte)
-		bmCBWFlags,     // bmCBWFlags: 0x80: data in (dev to host), 0x00: Data out
-		0x00,           // bCBWLUN
-		byte(len(cmd)), // bCBWCBLength
-
-		// SCSI cmd: (15)
-		0xcd, 0x00, 0x00, 0x00,
-		0x00, 0x06, 0x11, 0xf8,
-		0x70, 0x00, 0x40, 0x00,
-		0x00, 0x00, 0x00, 0x00,
+		0x55, 0x53, 0x42, 0x43, // USBC
+		0xde, 0xad, 0xbe, 0xef, // Tag
+		byte(blockLen), byte(blockLen >> 8), byte(blockLen >> 16), byte(blockLen >> 24),
+		bmCBWFlags,
+		0x00, byte(len(cmd)),
 	}
+	// SCSI Command (16 bytes total)
+	cmdBuf := make([]byte, 16)
+	copy(cmdBuf, cmd)
+	buf = append(buf, cmdBuf...)
 
-	copy(buf[15:], cmd)
-
-	if dpf.Debug {
-		log.Print("SCSI cmd: ", cmd)
-		log.Print("SCSI command: ", buf)
+	if d.Debug {
+		log.Printf("SCSI CMD PREP: %x", buf)
 	}
 	return buf
 }
 
-func (dpf *DPF) scsiGetAck() error {
-	buf := []byte{
-		0, 0, 0, 0,
-		0, 0, 0, 0,
-		0, 0, 0, 0,
-		0,
-	}
-	// Get ACK
-	if dpf.Debug {
-		log.Print("[ACK] Read ACK from device")
-	}
-	ack, err := libusb.Bulk_Transfer(dpf.udev, ax206endpIn, buf, scsiTimeout)
+func (d *DPF) scsiGetAck() error {
+	buf := make([]byte, 13)
+	n, err := d.epIn.Read(buf)
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed to read ACK: %w", err)
 	}
-	if dpf.Debug {
-		log.Print("[ACK] data ", ack)
+	if n < 4 || string(buf[:4]) != "USBS" {
+		return fmt.Errorf("Invalid ACK: %x", buf[:n])
 	}
-
-	if string(ack[:4]) != "USBS" {
-		return fmt.Errorf("Got invalid reply")
+	if d.Debug {
+		log.Printf("Got ACK: %x", buf[:n])
 	}
-	// pass back return code set by peer:
-	// return ansbuf[12];
 	return nil
 }
 
-func (dpf *DPF) scsiWrite(cmd []byte, data []byte) error {
-	var err error
-
-	// Write command to device
-	if dpf.Debug {
-		log.Print("[WRITE] Write command to device")
+func (d *DPF) scsiWrite(cmd []byte, data []byte) error {
+	header := d.scsiCmdPrepare(cmd, len(data), true)
+	if _, err := d.epOut.Write(header); err != nil {
+		return fmt.Errorf("Failed to send SCSI command: %w", err)
 	}
-	_, err = libusb.Bulk_Transfer(dpf.udev, ax206endpOut, dpf.scsiCmdPrepare(cmd, len(data), true), scsiTimeout)
-	if err != nil {
-		return err
-	}
-
-	// Write data to device
 	if data != nil {
-		if dpf.Debug {
-			log.Print("[WRITE] Write data to device")
-		}
-		_, err := libusb.Bulk_Transfer(dpf.udev, ax206endpOut, data, scsiTimeout)
-		if err != nil {
-			return err
+		if _, err := d.epOut.Write(data); err != nil {
+			return fmt.Errorf("Failed to send SCSI data: %w", err)
 		}
 	}
-
-	return dpf.scsiGetAck()
+	return d.scsiGetAck()
 }
 
-func (dpf *DPF) scsiRead(cmd []byte, blockLen int) ([]byte, error) {
-	var err error
-
-	// Write command to device
-	if dpf.Debug {
-		log.Print("[READ] Write command to device")
+func (d *DPF) scsiRead(cmd []byte, blockLen int) ([]byte, error) {
+	header := d.scsiCmdPrepare(cmd, blockLen, false)
+	if _, err := d.epOut.Write(header); err != nil {
+		return nil, fmt.Errorf("Failed to send SCSI read command: %w", err)
 	}
-	_, err = libusb.Bulk_Transfer(dpf.udev, ax206endpOut, dpf.scsiCmdPrepare(cmd, blockLen, false), scsiTimeout)
+
+	buf := make([]byte, blockLen)
+	n, err := d.epIn.Read(buf)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Failed to read SCSI data: %w", err)
 	}
-
-	if dpf.Debug {
-		log.Print("[READ] Read data from device")
+	if d.Debug {
+		log.Printf("Read data: %x", buf[:n])
 	}
-	// Read data from device
-	data1 := make([]byte, blockLen, blockLen)
-	data, err := libusb.Bulk_Transfer(dpf.udev, ax206endpIn, data1, scsiTimeout)
-	if err != nil {
-		return nil, err
+	if err := d.scsiGetAck(); err != nil {
+		return buf[:n], err
 	}
-	if dpf.Debug {
-		log.Print("[READ] data ", data)
-	}
-
-	err = dpf.scsiGetAck()
-	if err != nil {
-		return data, err
-	}
-
-	return data, nil
+	return buf[:n], nil
 }

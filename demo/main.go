@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/plumbum/go2dpf"
+	"github.com/chaosbiber/go2dpf"
 )
 
 func main() {
@@ -64,8 +64,8 @@ ForExit:
 			for x := r.Min.X; x < r.Max.X; x += 16 {
 				for y := r.Min.Y; y < r.Max.Y; y += 16 {
 					chunkRect := image.Rect(
-						(x+y) % w, y,
-						(x+y) % w + 16, y + 16)
+						(x+y)%w, y,
+						(x+y)%w+16, y+16)
 					chunk := img.SubImage(chunkRect).(*go2dpf.ImageRGB565)
 					// pp.Println(chunk)
 					if err := dpf.Blit(chunk); err != nil {
@@ -80,7 +80,7 @@ ForExit:
 }
 
 func LoremPixel(w, h int) (image.Image, error) {
-	url := fmt.Sprintf("http://lorempixel.com/%d/%d/", w, h)
+	url := fmt.Sprintf("https://picsum.photos/%d/%d/", w, h)
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
